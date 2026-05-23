@@ -462,7 +462,8 @@ async function startBatchProcessing(tabId) {
     cancelRequested: false,
     total: pages.length,
     currentTitle: '',
-    fileNames: new Set()
+    fileNames: new Set(),
+    failedPages: []
   };
 
   broadcastBatchUpdate('started', {
