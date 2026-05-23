@@ -1,6 +1,8 @@
 importScripts('lib/jszip.min.js');
 
 const MESSAGE_TIMEOUT = 30000;
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1000;
 const messageQueue = {};
 
 const createInitialBatchState = () => ({
@@ -15,7 +17,8 @@ const createInitialBatchState = () => ({
   cancelRequested: false,
   total: 0,
   currentTitle: '',
-  fileNames: new Set()
+  fileNames: new Set(),
+  failedPages: []
 });
 
 let batchState = createInitialBatchState();
@@ -255,7 +258,7 @@ function navigateToPage(tabId, url) {
   });
 }
 
-async function processSinglePage(page) {
+async function processSinglePage(page, retryCount = 0) {
   if (batchState.cancelRequested) return;
 
   const currentStep = batchState.processed + batchState.failed + 1;
@@ -264,20 +267,50 @@ async function processSinglePage(page) {
     message: `Processing ${currentStep}/${batchState.total}: ${page.title}`
   });
 
-  await navigateToPage(batchState.tabId, page.url);
-  if (batchState.cancelRequested) return;
+  try {
+    await navigateToPage(batchState.tabId, page.url);
+    if (batchState.cancelRequested) return;
 
-  const convertResponse = await sendMessageToTab(batchState.tabId, { action: 'convertToMarkdown' });
-  if (!convertResponse || !convertResponse.success) {
-    throw new Error(convertResponse?.error || 'Conversion failed');
+    const convertResponse = await sendMessageToTab(batchState.tabId, { action: 'convertToMarkdown' });
+    if (!convertResponse || !convertResponse.success) {
+      throw new Error(convertResponse?.error || 'Conversion failed');
+    }
+
+    const fileName = getUniqueFileName(convertResponse.markdownTitle || page.title);
+    batchState.convertedPages.push({ title: fileName, content: convertResponse.markdown });
+    batchState.processed += 1;
+    broadcastBatchUpdate('pageProcessed', {
+      message: `Converted ${batchState.processed}/${batchState.total}: ${page.title}`
+    });
+  } catch (error) {
+    // Retry logic for failed pages
+    if (retryCount < MAX_RETRY_ATTEMPTS && !batchState.cancelRequested) {
+      console.log(`Retry ${retryCount + 1}/${MAX_RETRY_ATTEMPTS} for page: ${page.title}`);
+      broadcastBatchUpdate('retrying', {
+        message: `Retrying ${page.title} (${retryCount + 1}/${MAX_RETRY_ATTEMPTS})...`,
+        level: 'warning'
+      });
+      
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+      
+      // Recursive retry
+      await processSinglePage(page, retryCount + 1);
+      return;
+    }
+    
+    // Max retries exceeded, mark as failed
+    batchState.failed += 1;
+    batchState.failedPages.push({
+      url: page.url,
+      title: page.title,
+      error: error.message || 'Unknown error'
+    });
+    broadcastBatchUpdate('pageFailed', {
+      message: `Failed ${page.title} after ${MAX_RETRY_ATTEMPTS} retries: ${error.message || error}`,
+      level: 'error'
+    });
   }
-
-  const fileName = getUniqueFileName(convertResponse.markdownTitle || page.title);
-  batchState.convertedPages.push({ title: fileName, content: convertResponse.markdown });
-  batchState.processed += 1;
-  broadcastBatchUpdate('pageProcessed', {
-    message: `Converted ${batchState.processed}/${batchState.total}: ${page.title}`
-  });
 }
 
 async function createZipArchive() {
@@ -288,6 +321,24 @@ async function createZipArchive() {
     indexContent += `- [${page.title}](${page.title}.md)\n`;
     zip.file(`${page.title}.md`, page.content);
   });
+
+  // Add failed pages report if any failures occurred
+  if (batchState.failedPages.length > 0) {
+    indexContent += '\n## Failed Pages\n\n';
+    batchState.failedPages.forEach((page, index) => {
+      indexContent += `${index + 1}. **${page.title}** - Error: ${page.error}\n   URL: ${page.url}\n\n`;
+    });
+    
+    // Also add a detailed failure report file
+    let failureReport = `# Failed Pages Report\n\n`;
+    failureReport += `Total Failed: ${batchState.failedPages.length}\n\n`;
+    batchState.failedPages.forEach((page, index) => {
+      failureReport += `## ${index + 1}. ${page.title}\n`;
+      failureReport += `- **URL:** ${page.url}\n`;
+      failureReport += `- **Error:** ${page.error}\n\n`;
+    });
+    zip.file('FAILED_PAGES.md', failureReport);
+  }
 
   zip.file('README.md', indexContent);
 
@@ -321,15 +372,7 @@ async function runBatchProcessing() {
         break;
       }
 
-      try {
-        await processSinglePage(page);
-      } catch (error) {
-        batchState.failed += 1;
-        broadcastBatchUpdate('pageFailed', {
-          message: `Failed ${page.title}: ${error.message || error}`,
-          level: 'error'
-        });
-      }
+      await processSinglePage(page);
     }
 
     if (batchState.cancelRequested) {
@@ -351,9 +394,13 @@ async function runBatchProcessing() {
     await createZipArchive();
 
     batchState.isRunning = false;
+    let finalMessage = `ZIP ready. Success ${batchState.processed}, Failed ${batchState.failed}.`;
+    if (batchState.failed > 0) {
+      finalMessage += ` Check console for failed pages.`;
+    }
     broadcastBatchUpdate('completed', {
-      message: `ZIP ready. Success ${batchState.processed}, Failed ${batchState.failed}.`,
-      level: 'success'
+      message: finalMessage,
+      level: batchState.failed > 0 ? 'warning' : 'success'
     }, false);
   } catch (error) {
     batchState.isRunning = false;
